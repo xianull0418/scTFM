@@ -2,10 +2,10 @@
 # 1. 核心数据与模型 (绝对不能传)
 # ==========================
 # 数据集目录 (通常很大)
-
+docs/
 raw_data/
 processed_data/
-
+.claude/
 # 模型权重文件 (PyTorch / TensorFlow / Keras)
 *.pth
 *.pt

@@ -16,12 +16,15 @@ class SingleCellDataModule(LightningDataModule):
         train_val_split: float = 0.95,
         pin_memory: bool = False,
         tile_cache_size: int = 4000000000, # Default 4GB
+        tiledb_config: dict = None, # [新增] 接收外部 TileDB 配置
     ):
         super().__init__()
         self.save_hyperparameters(logger=False)
         
         self.data_train = None
         self.data_val = None
+        # 使用传入配置或默认空字典
+        self.tiledb_config = tiledb_config or {}
 
     def setup(self, stage=None):
         """
@@ -38,17 +41,16 @@ class SingleCellDataModule(LightningDataModule):
         
         # -----------------------------------------------------------------
         # 【关键修复】定义全局无锁 Context
-        # 在 GPFS/S3 等网络存储上，必须禁用文件锁 (vfs.file.enable_filelocks)
-        # 增加 Tile Cache 减少 GPFS 访问
+        # 使用统一的 TileDB 配置 (与 Worker 保持一致)
         # -----------------------------------------------------------------
-        no_lock_cfg = tiledb.Config({
+        # 如果有传入配置则使用，否则使用默认的安全配置
+        cfg_dict = self.tiledb_config if self.tiledb_config else {
             "sm.compute_concurrency_level": "2",
             "sm.io_concurrency_level": "2",
-            "vfs.file.enable_filelocks": "false",  # <--- 核心：强制关锁
-            "sm.tile_cache_size": str(self.hparams.tile_cache_size), # <--- Tile 缓存
-        })
-        # 实例化 Context
-        ctx = tiledb.Ctx(no_lock_cfg)
+            "vfs.file.enable_filelocks": "false",
+            "sm.tile_cache_size": str(self.hparams.tile_cache_size),
+        }
+        ctx = tiledb.Ctx(tiledb.Config(cfg_dict))
 
         # 1. 读取 Schema 获取基因数量 (必须传入 ctx)
         try:
@@ -146,14 +148,12 @@ class SingleCellDataModule(LightningDataModule):
         self.data_train = TileDBDataset(counts_uri, train_idxs, n_genes)
         self.data_val = TileDBDataset(counts_uri, val_idxs, n_genes)
 
+        from omegaconf import OmegaConf
+        
         # 6. 实例化 Collator (用于 Batch 读取 TileDB)
-        # 将配置转换为字典传入，确保可序列化
-        collator_cfg = {
-            "sm.compute_concurrency_level": "2",
-            "sm.io_concurrency_level": "2",
-            "vfs.file.enable_filelocks": "false",
-            "sm.tile_cache_size": str(self.hparams.tile_cache_size),
-        }
+        # 将 YAML 中的配置透传给 Collator
+        # [关键修复] 必须将 OmegaConf 对象转为原生 dict，否则 TileDB Ctx 会报错
+        collator_cfg = OmegaConf.to_container(self.tiledb_config, resolve=True) if self.tiledb_config else None
         self.collator = TileDBCollator(counts_uri, n_genes, ctx_cfg=collator_cfg)
 
     def train_dataloader(self):
@@ -162,6 +162,9 @@ class SingleCellDataModule(LightningDataModule):
                 batch_size=self.hparams.batch_size,
                 num_workers=self.hparams.num_workers,
                 pin_memory=self.hparams.pin_memory,
+                # [关键修复] 必须关闭全局 Shuffle！
+                # 我们在 setup() 中已经做了 Chunked Shuffle (局部打乱)，
+                # 开启全局 Shuffle 会导致随机读取整个磁盘，引发 GPFS I/O 崩溃 (D状态进程)。
                 shuffle=True,
                 drop_last=True,
                 collate_fn=self.collator,  # <--- 使用自定义 Collator

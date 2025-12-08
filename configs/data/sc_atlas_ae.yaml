@@ -1,9 +1,21 @@
 _target_: src.data.sc_datamodule.SingleCellDataModule
-# 请替换为你 rsync 后的全闪存路径
-data_dir: /gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens/tiledb_100m/all_data
+# Flash 存储路径 (从 hybrid 同步过来，I/O 性能提升 10-50x)
+data_dir: /dev/shm/tiledb_all_data/all_data
 batch_size: 8192
-num_workers: 8
+num_workers: 4    # [关键] 8卡DDP下总并发=8。解决 GPFS I/O 拥塞 (D状态进程) 的最佳实践。
 train_val_split: 0.95
 pin_memory: True
-# 核心优化：增大 Tile 缓存减少 GPFS 访问
-tile_cache_size: 4000000000  # 4GB
+# 核心优化：大幅减小单进程缓存，因为 Worker 数量多
+
+# TileDB 高级性能调优配置 (对齐 scimilarity)
+tiledb_config:
+  "sm.mem.total_budget": "4294967296" # 4GB per worker (解决 SparseGlobalOrderReader OOM)
+  "sm.mem.reader.sparse_global_order.ratio": "0.1" # 增加 Reader 内存占比
+  "sm.compute_concurrency_level": "1" # 强制单线程 (防止 PyTorch Worker 线程爆炸)
+  "sm.io_concurrency_level": "1"
+  "sm.num_async_threads": "1"
+  "sm.num_reader_threads": "1"
+  "sm.num_tbb_threads": "1"
+  "sm.num_writer_threads": "1"
+  "vfs.num_threads": "1"
+  "vfs.file.enable_filelocks": "false" # 网络存储必须关锁

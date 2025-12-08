@@ -287,55 +287,81 @@ class AsyncBatchWriter:
 
 def consolidate_arrays(tiledb_path: Path):
     """合并 TileDB 碎片以优化读取性能"""
-    logger.info("Starting consolidation...")
+    logger.info(f"Starting consolidation on {tiledb_path}...")
     
-    # 1. Consolidate Counts
-    counts_uri = str(tiledb_path / "counts")
-    tiledb.consolidate(counts_uri)
-    tiledb.vacuum(counts_uri)
+    # 限制合并时的内存使用，防止炸机
+    cfg = tiledb.Config({
+        "sm.consolidation.buffer_size": "2147483648",  # 2GB buffer limit
+        "sm.compute_concurrency_level": "16"
+    })
+    ctx = tiledb.Ctx(cfg)
     
-    # 2. Consolidate Metadata
-    meta_uri = str(tiledb_path / "cell_metadata")
-    tiledb.consolidate(meta_uri)
-    tiledb.vacuum(meta_uri)
-    
-    logger.info("Consolidation complete.")
+    try:
+        # 1. Consolidate Counts
+        counts_uri = str(tiledb_path / "counts")
+        tiledb.consolidate(counts_uri, ctx=ctx)
+        tiledb.vacuum(counts_uri, ctx=ctx)
+        
+        # 2. Consolidate Metadata
+        meta_uri = str(tiledb_path / "cell_metadata")
+        tiledb.consolidate(meta_uri, ctx=ctx)
+        tiledb.vacuum(meta_uri, ctx=ctx)
+        
+        logger.info("Consolidation complete.")
+    except Exception as e:
+        logger.error(f"Consolidation failed (non-critical): {e}")
 
-def sync_to_disk(shm_path: Path, final_path: Path):
+def offload_batch_to_disk(shm_path: Path, final_path: Path):
     """
-    中间同步：合并碎片 -> Rsync -> (保留 SHM 继续写入)
+    【核心优化】内存卸载机制：
+    1. 将 RAM 中的新数据碎片 Rsync 到硬盘 (Append 模式)
+    2. 删除 RAM 中已同步的碎片，释放内存
+    这使得 RAM 变成一个无限循环使用的滑动窗口缓冲。
     """
-    logger.info("🔄 Triggering intermediate sync...")
+    logger.info("🔄 Offloading RAM buffer to Disk (Freeing Memory)...")
     t_start = time.time()
     
-    # 1. Consolidate (in RAM)
-    # 合并碎片，避免 rsync 传输大量小文件
-    # 注意：tiledb 数据在 shm_path/all_data 下
-    tiledb_path = shm_path / "all_data"
-    consolidate_arrays(tiledb_path)
-    
-    # 2. Rsync (RAM -> GPFS)
-    # 使用 --delete 确保 GPFS 上删除了被 consolidate 掉的旧碎片
+    # 1. Rsync (RAM -> GPFS) - Append Mode (严禁使用 --delete)
+    # 这会将新生成的 fragments 复制到硬盘
     if not final_path.parent.exists():
         final_path.parent.mkdir(parents=True, exist_ok=True)
         
     # 注意：源目录加斜杠 (shm_path/) 表示同步内容
-    # 去掉了 -P 以减少日志刷屏，保留 -av
-    cmd = ["rsync", "-av", "--delete", str(shm_path) + "/", str(final_path) + "/"]
+    # -a: 归档模式 (递归 + 保留属性)
+    cmd = ["rsync", "-av", str(shm_path) + "/", str(final_path) + "/"]
     try:
         subprocess.run(cmd, check=True)
-        logger.info(f"✅ Sync complete in {time.time() - t_start:.1f}s")
     except Exception as e:
         logger.error(f"❌ Sync failed: {e}")
+        return
+
+    # 2. 清理 RAM 中的碎片 (释放内存)
+    # 我们只删除 __fragments 下的数据，保留 Schema 和元数据结构
+    tiledb_root = shm_path / "all_data"
+    total_cleaned = 0
+    
+    if tiledb_root.exists():
+        for array_dir in tiledb_root.iterdir():
+            if not array_dir.is_dir(): continue
+            
+            frag_dir = array_dir / "__fragments"
+            if frag_dir.exists():
+                for frag in frag_dir.iterdir():
+                    # 碎片通常是目录 (uuid_timestamp_...)
+                    if frag.is_dir(): 
+                        shutil.rmtree(frag)
+                        total_cleaned += 1
+                    
+    logger.info(f"✅ Offload complete. Cleaned {total_cleaned} fragments from RAM. Time: {time.time() - t_start:.1f}s")
 
 def main():
     parser = argparse.ArgumentParser(description="Efficient TileDB Converter (In-Memory Fast Track)")
-    parser.add_argument("--csv_path", type=str, default="data/assets/ae_data_info_1000.csv")
+    parser.add_argument("--csv_path", type=str, default="data/assets/ae_data_info.csv")
     parser.add_argument("--vocab_path", type=str, default="data/assets/gene_order.tsv")
     
     # 【最终目的地】GPFS 路径
     parser.add_argument("--final_output_dir", type=str, 
-                        default="/gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens/tiledb_10m")
+                        default="/gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens/tiledb_100m")
     
     parser.add_argument("--min_genes", type=int, default=200)
     parser.add_argument("--target_sum", type=float, default=1e4)
@@ -343,8 +369,8 @@ def main():
     # 优化：设置为 Tile Extent (4096) 的整数倍，确保 Dense Array 写入对齐
     # 4096 * 128 = 524288
     parser.add_argument("--batch_size", type=int, default=524288)
-    parser.add_argument("--max_files", type=int, default=1000)
-    parser.add_argument("--sync_interval", type=int, default=-1, help="每处理多少个文件同步一次到硬盘 (-1 表示不开启)")
+    parser.add_argument("--max_files", type=int, default=-1, help="处理文件数量 (-1 表示处理 CSV 中的所有文件)")
+    parser.add_argument("--sync_interval", type=int, default=3100, help="每处理多少个文件卸载一次内存到硬盘 (建议 200-500)")
     
     args = parser.parse_args()
     
@@ -412,9 +438,9 @@ def main():
                     # --- [新增] 定期同步逻辑 ---
                     processed_count += 1
                     if sync_interval > 0 and processed_count % sync_interval == 0:
-                        logger.info(f"⏳ Reached {processed_count} files. Pausing to sync...")
+                        logger.info(f"⏳ Reached {processed_count} files. Pausing to offload RAM...")
                         writer.wait_until_idle() # 1. 确保写入队列清空
-                        sync_to_disk(shm_path, final_path) # 2. 整理碎片并同步
+                        offload_batch_to_disk(shm_path, final_path) # 2. 卸载数据并清理 RAM
                         logger.info("▶️ Resuming processing...")
                         
             except Exception as e:
@@ -422,44 +448,45 @@ def main():
 
     writer.finish()
     
-    # --- [新增] 合并碎片 (Consolidation) ---
-    # 这一步对于 GPFS 性能至关重要，避免数千个小文件
-    consolidate_arrays(tiledb_path)
-    
-    # 保存 Metadata
+    # --- [修改] 保存 Metadata (提前到搬运前) ---
     metadata = {
         'total_cells': writer.global_cell_offset,
         'n_genes': len(target_genes),
-        'storage_path': str(final_path) # 这里记录最终路径
+        'storage_path': str(final_path)
     }
     with open(tiledb_path / 'metadata.json', 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    # --- 6. 最终搬运 (RAM -> GPFS) ---
+    # --- [修改] 6. 最终搬运 (RAM -> GPFS) ---
+    # 策略：先搬运，释放 RAM，再做合并！
     logger.info("="*60)
-    logger.info("Processing Complete. Moving data from RAM to GPFS...")
-    logger.info("This may take a while, but it's much faster than direct writing.")
+    logger.info("Processing Complete. Finalizing data move...")
+    logger.info("Strategy: Move remaining fragments -> Clear RAM -> Consolidate on Disk")
     
     # 确保目标父目录存在
     final_path.parent.mkdir(parents=True, exist_ok=True)
-    # 移除暴力删除，改用 rsync --delete 增量更新，避免在此前做过 sync 的情况下浪费时间
-    # if final_path.exists():
-    #     shutil.rmtree(final_path) 
     
-    # 使用 rsync 进行搬运 (比 shutil 更稳健，显示进度)
+    # 使用 rsync 进行搬运
     try:
-        # 添加 --delete 以确保最终状态完全一致
-        cmd = ["rsync", "-avP", "--delete", str(shm_path) + "/", str(final_path) + "/"]
+        # [关键修改] 去掉 --delete，因为之前已经卸载了一部分数据到硬盘，
+        # 如果使用 delete，会把之前卸载的数据（因为不在当前的 RAM 里）给删掉！
+        cmd = ["rsync", "-avP", str(shm_path) + "/", str(final_path) + "/"]
         subprocess.run(cmd, check=True)
-        logger.info(f"✅ SUCCESS! Data moved to: {final_path}")
+        logger.info(f"✅ SUCCESS! Final data moved to: {final_path}")
         
-        # 搬运成功后，清理内存
+        # 搬运成功后，清理内存，防止 OOM
         shutil.rmtree(shm_path)
-        logger.info("RAM buffer cleaned.")
+        logger.info("RAM buffer cleaned. Memory released.")
+        
+        # --- [修改] 7. 在硬盘上合并 (Consolidation) ---
+        # 现在内存空出来了，可以安全地在 GPFS 上做合并
+        # 注意：路径要指向 final_path 下的 all_data
+        target_tiledb_path = final_path / "all_data"
+        consolidate_arrays(target_tiledb_path)
         
     except Exception as e:
-        logger.error(f"❌ Error moving data: {e}")
-        logger.error(f"⚠️ YOUR DATA IS STILL IN: {shm_path}. PLEASE MOVE IT MANUALLY!")
+        logger.error(f"❌ Error during move/consolidate: {e}")
+        logger.error(f"⚠️ Check {shm_path} or {final_path}")
 
 if __name__ == "__main__":
     multiprocessing.set_start_method('fork', force=True)
