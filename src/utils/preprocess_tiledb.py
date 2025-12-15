@@ -1,5 +1,6 @@
 import multiprocessing
 import os
+# tiledb底层是c，用fork会导致每个进程都初始化实例
 try:
     multiprocessing.set_start_method('spawn', force=True)
 except RuntimeError:
@@ -17,22 +18,17 @@ import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-# 忽略 Scanpy/AnnData 的一些繁琐警告
 warnings.filterwarnings('ignore')
 
-# ==========================================
-# 全局配置
-# ==========================================
 CSV_PATH = '/gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/assets/ae_data_info.csv'
 GENE_ORDER_PATH = "/gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/assets/gene_order.tsv"
 OUTPUT_BASE_URI = "/fast/data/scTFM/ae/tile_4000_fix"
 NUM_SAMPLES = 4000
-MAX_WORKERS = 16   # 保持高性能并发
+MAX_WORKERS = 16  
 
-# ==========================================
-# Worker 初始化与处理函数
-# ==========================================
+
 # 定义全局变量
+# 这样每个线程读取的时候共享同一个变量
 global_target_genes = None
 global_target_gene_map = None
 
@@ -50,10 +46,7 @@ def process_single_file(row_data):
     file_path = row['file_path']
     is_full_val = row['full_validation_dataset']
     
-    # =======================================================
-    # 【修改 1】: 使用文件名作为 ID，而不是随机 UUID
-    # 例如: /path/to/SRX21870170.h5ad -> SRX21870170
-    # =======================================================
+    # 用文件名作为 ID，而不是随机 UUID
     try:
         file_name = os.path.basename(file_path)       # 获取文件名 "SRX21870170.h5ad"
         sample_id = os.path.splitext(file_name)[0]    # 去掉后缀 "SRX21870170"
@@ -69,10 +62,8 @@ def process_single_file(row_data):
         adata.var_names = adata.var['gene_symbols'].astype(str)
         adata.var_names_make_unique()
         
-        # =======================================================
-        # 【逻辑修正】: 先过滤细胞质量，再切片
+        # 先过滤细胞质量，再切片
         # 只要原始数据中检测到 >200 个基因，就视为有效细胞
-        # =======================================================
         sc.pp.filter_cells(adata, min_genes=200)
         
         if adata.n_obs == 0:
@@ -150,9 +141,7 @@ def process_single_file(row_data):
     except Exception as e:
         return f"Error: {str(e)}"
 
-# ==========================================
-# 主程序
-# ==========================================
+
 if __name__ == "__main__":
     # 1. 准备输出目录
     if not os.path.exists(OUTPUT_BASE_URI):
@@ -215,9 +204,9 @@ if __name__ == "__main__":
         pbar.close()
 
     print("\n" + "="*30)
-    print("Batch Processing Complete")
+    print("处理完成")
     print(f"Success: {results['Success']}")
     print(f"Skipped: {results['Skipped (Low quality raw cells)']}")
     print(f"Errors : {results['Errors']}")
-    print(f"Data saved to directory: {OUTPUT_BASE_URI}/")
+    print(f"数据保存到目录: {OUTPUT_BASE_URI}/")
     print("="*30)
