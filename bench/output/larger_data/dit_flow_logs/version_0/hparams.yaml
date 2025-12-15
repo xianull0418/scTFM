@@ -1,0 +1,18 @@
+input_dim: 28231
+config:
+  data_dir: /gpfs/hybrid/data/public/TEDD/5.link_cells/
+  output_dir: bench/output/larger_data
+  n_files_to_load: 50
+  train_ratio: 0.8
+  gestation_period: 280.0
+  hidden_size: 1024
+  depth: 24
+  num_heads: 16
+  mlp_ratio: 4.0
+  class_dropout_prob: 0.1
+  batch_size: 256
+  lr: 0.0001
+  epochs: 10
+  seed: 42
+  accelerator: auto
+  devices: 1

@@ -1,0 +1,15 @@
+# @package _global_
+
+# SAE (Sparse Autoencoder) 
+# 本质上还是使用 Vanilla AE 架构，但配合 L1 正则化 Loss (在 AELitModule 中处理)
+
+# 覆盖 AELitModule 的参数
+model:
+  reg_type: l1
+  reg_weight: 1e-4
+
+# 使用基础的 Vanilla 网络结构
+defaults:
+  - /model/net/ae: vanilla
+  - _self_
+

@@ -1,21 +1,28 @@
 _target_: src.data.sc_datamodule.SingleCellDataModule
-# Flash 存储路径 (从 hybrid 同步过来，I/O 性能提升 10-50x)
-data_dir: /dev/shm/tiledb_all_data/all_data
-batch_size: 8192
-num_workers: 2    # [关键] 8卡DDP下总并发=8。解决 GPFS I/O 拥塞 (D状态进程) 的最佳实践。
-train_val_split: 0.95
-pin_memory: True
-# 核心优化：大幅减小单进程缓存，因为 Worker 数量多
 
-# TileDB 高级性能调优配置 (对齐 scimilarity)
-tiledb_config:
-  "sm.mem.total_budget": "4294967296" # 4GB per worker (解决 SparseGlobalOrderReader OOM)
-  "sm.mem.reader.sparse_global_order.ratio": "0.1" # 增加 Reader 内存占比
-  "sm.compute_concurrency_level": "1" # 强制单线程 (防止 PyTorch Worker 线程爆炸)
-  "sm.io_concurrency_level": "1"
-  "sm.num_async_threads": "1"
-  "sm.num_reader_threads": "1"
-  "sm.num_tbb_threads": "1"
-  "sm.num_writer_threads": "1"
-  "vfs.num_threads": "1"
-  "vfs.file.enable_filelocks": "false" # 网络存储必须关锁
+# 数据存储路径
+# 建议确认此路径是否与 preprocess_tiledb.py 生成的路径一致
+data_dir: /fast/data/scTFM/ae/tile_4000/
+
+# 传递给 SomaCollectionDataset 的 batch_size
+# 因为我们在 Dataset 内部做 batching，所以这个参数控制的是 yield 出的 tensor 大小
+batch_size: 512
+
+# DataLoader 参数
+# [关键] 8卡DDP下总并发=8*4=32。解决 GPFS I/O 拥塞的最佳实践。
+num_workers: 16    
+
+# 是否锁页内存，通常为 True 以加速 host 到 device 的传输
+pin_memory: True
+
+# 是否保持 worker 进程存活
+# 对于 TileDB 这种初始化开销大的数据集，必须设为 True，否则每个 epoch 都会重新打开文件
+persistent_workers: True
+
+# TileDB 读取块大小 (行数)，越大读取越快但内存占用越高
+# 默认 16384，可根据内存调整
+io_chunk_size: 16384
+
+# 每个 worker 预取的 batch 数量
+# 由于我们使用 iterable dataset 且 batch 较大，设为 2 即可
+prefetch_factor: 2

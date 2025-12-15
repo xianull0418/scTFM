@@ -1,193 +1,112 @@
-import tiledb
+from typing import Optional
+
 import torch
-import numpy as np
-import json
-import os
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
-from src.data.components.tiledb_dataset import TileDBDataset, TileDBCollator
+
+from src.data.components.ae_dataset import SomaCollectionDataset
 
 class SingleCellDataModule(LightningDataModule):
+    """
+    单细胞数据的 PyTorch Lightning DataModule，使用 SomaCollectionDataset。
+    
+    关键特性：
+    Dataset 会直接 yield 一个 batch 的数据，因此 DataLoader 初始化时必须设置 batch_size=None。
+    
+    Split Labels:
+    0: Train (ID) - 用于训练
+    1: Val (ID)   - 用于验证
+    2: Test (ID)  - 用于测试 (同分布)
+    3: Test (OOD) - 用于测试 (外分布) - 暂不需要
+    """
+
     def __init__(
         self,
-        data_dir: str,
-        batch_size: int = 1024,
-        num_workers: int = 16,
-        train_val_split: float = 0.95,
-        pin_memory: bool = False,
-        tile_cache_size: int = 4000000000, # Default 4GB
-        tiledb_config: dict = None, # [新增] 接收外部 TileDB 配置
+        data_dir: str = "data/",
+        batch_size: int = 256,
+        num_workers: int = 4,
+        pin_memory: bool = True,
+        io_chunk_size: int = 16384,
+        prefetch_factor: int = 2,
+        persistent_workers: bool = True,
     ):
+        """
+        Args:
+            data_dir: 数据集根目录
+            batch_size: 每个 batch 的大小 (直接传递给 SomaCollectionDataset)
+            num_workers: DataLoader 的 worker 数量
+            pin_memory: 是否将数据锁在内存中 (建议 True)
+            io_chunk_size: TileDB 读取时的 chunk 大小 (影响内存占用)
+            prefetch_factor: 每个 worker 预加载的 batch 数量
+            persistent_workers: 是否保持 workers 存活 (避免重复初始化开销)
+        """
         super().__init__()
+
+        # 允许通过 self.hparams 访问 init 参数
         self.save_hyperparameters(logger=False)
-        
-        self.data_train = None
-        self.data_val = None
-        # 使用传入配置或默认空字典
-        self.tiledb_config = tiledb_config or {}
 
-    def setup(self, stage=None):
+        self.data_train: Optional[SomaCollectionDataset] = None
+        self.data_val: Optional[SomaCollectionDataset] = None
+        # self.data_test: Optional[SomaCollectionDataset] = None # 暂时不需要Test，或者根据需求开启
+
+    def setup(self, stage: Optional[str] = None):
         """
-        在 DDP 模式下，setup 会在每张显卡的进程里都运行一次。
-        如果有 8 张卡，就会有 8 个进程同时读取 GPFS。
-        必须强制关闭 TileDB 文件锁，否则会发生死锁 (Deadlock)。
+        加载数据。设置变量: `self.data_train`, `self.data_val`.
+        
+        这个方法会被 trainer.fit() 和 trainer.test() 调用。
+        根据用户指示，只需要读取 split_label 0 (Train) 和 1 (Val)。
         """
-        # 防止重复 setup
-        if self.data_train and self.data_val:
-            return
-
-        counts_uri = f"{self.hparams.data_dir}/counts"
-        meta_uri = f"{self.hparams.data_dir}/cell_metadata"
-        
-        # -----------------------------------------------------------------
-        # 【关键修复】定义全局无锁 Context
-        # 使用统一的 TileDB 配置 (与 Worker 保持一致)
-        # -----------------------------------------------------------------
-        # 如果有传入配置则使用，否则使用默认的安全配置
-        cfg_dict = self.tiledb_config if self.tiledb_config else {
-            "sm.compute_concurrency_level": "2",
-            "sm.io_concurrency_level": "2",
-            "vfs.file.enable_filelocks": "false",
-            "sm.tile_cache_size": str(self.hparams.tile_cache_size),
-        }
-        ctx = tiledb.Ctx(tiledb.Config(cfg_dict))
-
-        # 1. 读取 Schema 获取基因数量 (必须传入 ctx)
-        try:
-            with tiledb.open(counts_uri, mode='r', ctx=ctx) as A:
-                n_genes = A.schema.domain.dim("gene_index").domain[1] + 1
-        except Exception as e:
-            raise FileNotFoundError(f"Could not open TileDB at {counts_uri}. Check path!") from e
-
-        # 2. 读取 Metadata 进行过滤 (必须传入 ctx)
-        print(f"Loading metadata from {meta_uri}...")
-        
-        # [Fix] 尝试从 metadata.json 获取真实的 total_cells
-        # 对于 Dense Array，必须指定读取范围，不能使用 [:]，否则会读取整个 Domain (int64.max) 导致 OOM
-        total_cells = None
-        meta_json_path = os.path.join(self.hparams.data_dir, "metadata.json")
-        if os.path.exists(meta_json_path):
-            try:
-                with open(meta_json_path, 'r') as f:
-                    meta_info = json.load(f)
-                    total_cells = meta_info.get('total_cells')
-                    print(f"Found metadata.json: total_cells = {total_cells}")
-            except Exception as e:
-                print(f"Warning: Failed to read metadata.json: {e}")
-
-        try:
-            with tiledb.open(meta_uri, mode='r', ctx=ctx) as A:
-                # 只读取需要的列，减少 IO
-                if total_cells is not None:
-                    # 精确读取有效范围 (Python 切片是左闭右开，所以使用 total_cells)
-                    # 例如: total_cells=100, 索引 0..99, 切片 0:100 返回 100 个元素
-                    is_ood = A.query(attrs=["is_ood"])[0:total_cells]["is_ood"]
-                else:
-                    # 备选方案: 如果没有 json (比如旧数据)，尝试读取非空域或直接全读 (可能有风险)
-                    print("Warning: total_cells unknown, using full slice (risky for Dense Arrays)...")
-                    # 对于 Dense Array，如果没有 non_empty_domain，这步可能会挂
-                    # 但我们假设旧数据是 Sparse 的，所以 [:] 是安全的
-                    is_ood = A.query(attrs=["is_ood"])[:]["is_ood"]
-                    
-        except Exception as e:
-             raise FileNotFoundError(f"Could not read metadata at {meta_uri}") from e
-        
-        # 3. 筛选 In-Distribution 数据 (is_ood == 0)
-        valid_indices = np.where(is_ood == 0)[0]
-        total_valid = len(valid_indices)
-        
-        # 4. 固定种子 Shuffle 并划分 (使用 Chunked Shuffle 优化 GPFS 性能)
-        print(f"Applying Chunked Shuffle optimization for GPFS...")
-        
-        # A. 确保物理顺序 (利用 TileDB 的空间局部性)
-        valid_indices.sort()
-        
-        # B. 定义块大小 (Tile Extent 4096 的倍数)
-        # 4096 * 20 ≈ 80k 细胞。在这个范围内随机，既保证了 Batch 的随机性，
-        # 又保证了读取只会命中 ~20 个 Tile，极大提高 Cache 命中率并减少读放大。
-        chunk_size = 4096 * 20 
-        rng = np.random.default_rng(seed=42)
-        
-        if len(valid_indices) > chunk_size:
-            n_chunks = len(valid_indices) // chunk_size
-            
-            # 分割主数据和剩余数据
-            main_part = valid_indices[:n_chunks * chunk_size]
-            rest_part = valid_indices[n_chunks * chunk_size:]
-            
-            # Reshape 成 (n_chunks, chunk_size)
-            # 注意：创建副本以避免 View 问题
-            chunks = main_part.reshape(n_chunks, chunk_size).copy()
-            
-            # C. 块间 Shuffle (宏观随机：决定先读哪一块 80k 细胞)
-            rng.shuffle(chunks)
-            
-            # D. 块内 Shuffle (微观随机：块内 80k 细胞完全打乱)
-            for i in range(n_chunks):
-                rng.shuffle(chunks[i])
-            
-            shuffled_main = chunks.flatten()
-            
-            # 剩余部分也 shuffle
-            rng.shuffle(rest_part)
-            
-            valid_indices = np.concatenate([shuffled_main, rest_part])
-        else:
-            # 数据量太小，直接全局 Shuffle
-            rng.shuffle(valid_indices)
-        
-        n_train = int(total_valid * self.hparams.train_val_split)
-        train_idxs = valid_indices[:n_train]
-        val_idxs = valid_indices[n_train:]
-        
-        print(f"Dataset Setup: {total_valid} cells (Filtered OOD).")
-        print(f"Train: {len(train_idxs)} | Val: {len(val_idxs)}")
-
-        # 5. 实例化 Dataset
-        # 注意：TileDBDataset 内部的 __getitem__ 也必须有关锁逻辑
-        self.data_train = TileDBDataset(counts_uri, train_idxs, n_genes)
-        self.data_val = TileDBDataset(counts_uri, val_idxs, n_genes)
-
-        from omegaconf import OmegaConf
-        
-        # 6. 实例化 Collator (用于 Batch 读取 TileDB)
-        # 将 YAML 中的配置透传给 Collator
-        # [关键修复] 必须将 OmegaConf 对象转为原生 dict，否则 TileDB Ctx 会报错
-        collator_cfg = OmegaConf.to_container(self.tiledb_config, resolve=True) if self.tiledb_config else None
-        self.collator = TileDBCollator(counts_uri, n_genes, ctx_cfg=collator_cfg)
-
-    def train_dataloader(self):
-            # 1. 基础参数
-            loader_args = dict(
+        # 仅当未加载时才加载数据集
+        if not self.data_train and not self.data_val:
+            # 训练集 (split_label=0: Train ID)
+            self.data_train = SomaCollectionDataset(
+                root_dir=self.hparams.data_dir,
+                split_label=0,
+                io_chunk_size=self.hparams.io_chunk_size,
                 batch_size=self.hparams.batch_size,
-                num_workers=self.hparams.num_workers,
-                pin_memory=self.hparams.pin_memory,
-                # [关键修复] 必须关闭全局 Shuffle！
-                # 我们在 setup() 中已经做了 Chunked Shuffle (局部打乱)，
-                # 开启全局 Shuffle 会导致随机读取整个磁盘，引发 GPFS I/O 崩溃 (D状态进程)。
-                shuffle=True,
-                drop_last=True,
-                collate_fn=self.collator,  # <--- 使用自定义 Collator
             )
             
-            # 2. 只有在有 Worker 的时候才启用 spawn 和持久化
-            if self.hparams.num_workers > 0:
-                loader_args['persistent_workers'] = True
-                loader_args['multiprocessing_context'] = 'spawn'  # <--- 动态添加
-                
-            return DataLoader(self.data_train, **loader_args)
+            # 验证集 (split_label=1: Val ID)
+            self.data_val = SomaCollectionDataset(
+                root_dir=self.hparams.data_dir,
+                split_label=1,
+                io_chunk_size=self.hparams.io_chunk_size,
+                batch_size=self.hparams.batch_size,
+            )
+            
+            # 注意：split_label 2 (Test ID) and 3 (Test OOD) 目前未加载
+            # 如果后续需要测试，可以在这里添加
+
+    def train_dataloader(self):
+        """返回训练集的 DataLoader"""
+        return DataLoader(
+            dataset=self.data_train,
+            batch_size=None,  # <--- 关键！Dataset 已经处理了 batching
+            num_workers=self.hparams.num_workers,
+            prefetch_factor=self.hparams.prefetch_factor,
+            pin_memory=self.hparams.pin_memory,
+            persistent_workers=self.hparams.persistent_workers, # 使用配置参数
+        )
 
     def val_dataloader(self):
-        loader_args = dict(
-            batch_size=self.hparams.batch_size,
+        """返回验证集的 DataLoader"""
+        return DataLoader(
+            dataset=self.data_val,
+            batch_size=None,  # <--- 关键！
             num_workers=self.hparams.num_workers,
+            prefetch_factor=self.hparams.prefetch_factor,
             pin_memory=self.hparams.pin_memory,
-            shuffle=False,
-            collate_fn=self.collator,  # <--- 使用自定义 Collator
+            persistent_workers=self.hparams.persistent_workers,
         )
-        
-        if self.hparams.num_workers > 0:
-            loader_args['persistent_workers'] = True
-            loader_args['multiprocessing_context'] = 'spawn' # <--- 动态添加
-            
-        return DataLoader(self.data_val, **loader_args)
+
+    def teardown(self, stage: Optional[str] = None):
+        """fit 或 test 结束后的清理工作"""
+        pass
+
+    def state_dict(self):
+        """保存到 checkpoint 的额外状态"""
+        return {}
+
+    def load_state_dict(self, state_dict):
+        """加载 checkpoint 时的操作"""
+        pass

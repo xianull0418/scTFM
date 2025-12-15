@@ -84,7 +84,7 @@ def get_best_checkpoint(run_dir):
 def setup_dataloaders(data_dir, batch_size=1024, seed=42):
     """
     重新构建数据集划分逻辑，获取 ID-Validation 和 OOD-Test 数据集。
-    复制自 sc_datamodule.py 的逻辑以确保一致性。
+    基于预计算的 split_label 进行划分，确保与训练时一致。
     """
     counts_uri = os.path.join(data_dir, "counts")
     meta_uri = os.path.join(data_dir, "cell_metadata")
@@ -101,7 +101,7 @@ def setup_dataloaders(data_dir, batch_size=1024, seed=42):
     with tiledb.open(counts_uri, mode='r', ctx=ctx) as A:
         n_genes = A.schema.domain.dim("gene_index").domain[1] + 1
         
-    # 2. 读取 is_ood 标签
+    # 2. 读取 split_label (替代旧的 is_ood 和动态划分)
     # 尝试读取 metadata.json 获取 total_cells
     total_cells = None
     meta_json_path = os.path.join(data_dir, "metadata.json")
@@ -115,58 +115,41 @@ def setup_dataloaders(data_dir, batch_size=1024, seed=42):
             
     with tiledb.open(meta_uri, mode='r', ctx=ctx) as A:
         if total_cells is not None:
-            is_ood = A.query(attrs=["is_ood"])[0:total_cells]["is_ood"]
+            split_labels = A.query(attrs=["split_label"])[0:total_cells]["split_label"]
         else:
-            is_ood = A.query(attrs=["is_ood"])[:]["is_ood"]
+            split_labels = A.query(attrs=["split_label"])[:]["split_label"]
             
-    # 3. ID 数据处理 (is_ood == 0)
-    valid_indices_id = np.where(is_ood == 0)[0]
+    # 3. 根据标签划分
+    # 0: Train (ID)
+    # 1: Val (ID) -> 训练过程中的验证
+    # 2: Test (ID) -> 独立的 ID 测试集 (Benchmark 用)
+    # 3: Test (OOD) -> 独立的 OOD 测试集 (Benchmark 用)
     
-    # 重现 Shuffle 和 Split 逻辑
-    valid_indices_id.sort()
-    chunk_size = 4096 * 20
-    rng = np.random.default_rng(seed=seed)
+    # Benchmark 脚本应优先使用 Test Set (Label=2)
+    test_id_idxs = np.where(split_labels == 2)[0]
+    ood_idxs = np.where(split_labels == 3)[0]
     
-    if len(valid_indices_id) > chunk_size:
-        n_chunks = len(valid_indices_id) // chunk_size
-        main_part = valid_indices_id[:n_chunks * chunk_size]
-        rest_part = valid_indices_id[n_chunks * chunk_size:]
-        
-        chunks = main_part.reshape(n_chunks, chunk_size).copy()
-        rng.shuffle(chunks)
-        for i in range(n_chunks):
-            rng.shuffle(chunks[i])
-        
-        shuffled_main = chunks.flatten()
-        rng.shuffle(rest_part)
-        valid_indices_id = np.concatenate([shuffled_main, rest_part])
-    else:
-        rng.shuffle(valid_indices_id)
-        
-    # Split (默认 0.95 train, 0.05 val)
-    train_val_split = 0.95
-    n_train = int(len(valid_indices_id) * train_val_split)
-    val_idxs = valid_indices_id[n_train:]
+    # 容错：如果没有 Test Set (Label=2)，则回退到 Validation (Label=1) 并给出警告
+    if len(test_id_idxs) == 0:
+         logger.warning("未找到 Test ID (Label=2) 数据，回退使用 Validation (Label=1) 进行测评。")
+         test_id_idxs = np.where(split_labels == 1)[0]
     
-    # 4. OOD 数据处理 (is_ood == 1)
-    ood_idxs = np.where(is_ood == 1)[0]
-    
-    logger.info(f"Data Split - ID (Val): {len(val_idxs)}, OOD (Test): {len(ood_idxs)}")
+    logger.info(f"Data Split for Benchmark - ID (Test): {len(test_id_idxs)}, OOD (Test): {len(ood_idxs)}")
     
     # 创建 Datasets
-    ds_val = TileDBDataset(counts_uri, val_idxs, n_genes)
+    ds_test_id = TileDBDataset(counts_uri, test_id_idxs, n_genes)
     ds_ood = TileDBDataset(counts_uri, ood_idxs, n_genes)
     
     collator = TileDBCollator(counts_uri, n_genes, ctx_cfg=tiledb_cfg)
     
-    loader_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, collate_fn=collator, num_workers=4, persistent_workers=True, multiprocessing_context='spawn')
+    loader_test_id = DataLoader(ds_test_id, batch_size=batch_size, shuffle=False, collate_fn=collator, num_workers=4, persistent_workers=True, multiprocessing_context='spawn')
     
     # OOD 可能为空
     loader_ood = None
     if len(ood_idxs) > 0:
         loader_ood = DataLoader(ds_ood, batch_size=batch_size, shuffle=False, collate_fn=collator, num_workers=4, persistent_workers=True, multiprocessing_context='spawn')
         
-    return loader_val, loader_ood
+    return loader_test_id, loader_ood
 
 def evaluate_model(model, dataloader, device, desc="ID"):
     """
@@ -500,7 +483,7 @@ def run_benchmark(run_dir, wandb_base_cfg):
     config_dict = OmegaConf.to_container(cfg, resolve=True)
     
     run = wandb.init(
-        project=wandb_cfg.get("project", "scTime-AE-bench"),
+        project=wandb_cfg.get("project", "scTime-AE-bench_1210"),
         name=run_name,
         config=config_dict,
         job_type="benchmark",
@@ -509,7 +492,7 @@ def run_benchmark(run_dir, wandb_base_cfg):
     )
     
     # 6. 执行评估 (ID)
-    res_id = evaluate_model(model, loader_id, device, desc="ID Validation")
+    res_id = evaluate_model(model, loader_id, device, desc="ID Test")
     wandb.log({
         "eval/id_mse": res_id['mse'],
         "eval/id_cell_corr": res_id['mean_cell_corr'],
