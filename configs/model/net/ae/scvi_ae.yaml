@@ -1,0 +1,33 @@
+# scVI-style Autoencoder (SCVIAE)
+#
+# 核心设计 (参考 scVI):
+# - Encoder 输入: log1p(normalized_counts)
+# - Decoder 输出: softmax(rho) - 基因比例，和为 1
+# - NB 均值: mu = library_size * rho
+# - Loss: -log NB(counts | mu, theta)
+#
+# 优势:
+# 1. Library size 分离 - latent 只编码生物信号
+# 2. Softmax 输出 - 可解释的基因比例
+# 3. NB 分布 - 正确建模 count 数据
+#
+# 需要配合 SomaSCVIDataset 使用
+
+_target_: src.models.components.ae.scvi_ae.SCVIAE
+
+# 基因数 (会被数据集覆盖)
+n_input: 28231
+
+# 网络结构
+n_hidden: 256
+n_latent: 64
+n_layers: 2
+
+# 正则化
+dropout_rate: 0.1
+activation: "GELU"
+use_residual: true
+
+# NB 分布参数
+dispersion: "gene"        # 'gene' (推荐) 或 'gene-cell'
+gene_likelihood: "nb"     # 'nb' 或 'zinb'

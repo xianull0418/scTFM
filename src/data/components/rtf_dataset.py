@@ -420,13 +420,32 @@ class SomaRTFDataset(IterableDataset):
             if len(obs_all) == 0:
                 return
 
-            # [关键] 检查 obs_id 列是否存在
-            if 'obs_id' not in obs_all.columns:
-                # 跳过没有 obs_id 的 shard（可能是不兼容的数据源）
+            # [关键] 确定使用哪个列作为细胞索引
+            # 优先使用 obs_id，如果不存在或无法匹配 next_cell_id，则使用 new_index
+            cell_id_col = None
+
+            # 检查 next_cell_id 是否能匹配 obs_id 或 new_index
+            if 'next_cell_id' in obs_all.columns:
+                valid_next = obs_all[obs_all['next_cell_id'].notna()]['next_cell_id'].head(100)
+
+                if 'obs_id' in obs_all.columns:
+                    obs_id_set = set(obs_all['obs_id'].astype(str))
+                    matches = sum(1 for x in valid_next if str(x) in obs_id_set)
+                    if matches > len(valid_next) * 0.5:  # 超过 50% 匹配
+                        cell_id_col = 'obs_id'
+
+                if cell_id_col is None and 'new_index' in obs_all.columns:
+                    new_index_set = set(obs_all['new_index'].astype(str))
+                    matches = sum(1 for x in valid_next if str(x) in new_index_set)
+                    if matches > len(valid_next) * 0.5:  # 超过 50% 匹配
+                        cell_id_col = 'new_index'
+
+            if cell_id_col is None:
+                # 无法确定细胞索引列，跳过
                 return
 
-            # [关键] 使用 obs_id 作为索引，因为 next_cell_id 存储的是 obs_id
-            obs_all = obs_all.set_index('obs_id')
+            # [关键] 使用确定的列作为索引
+            obs_all = obs_all.set_index(cell_id_col)
 
             # 2. 筛选当前 split 的细胞作为"起点"
             obs_query = obs_all[obs_all['split_label'] == self.split_label]

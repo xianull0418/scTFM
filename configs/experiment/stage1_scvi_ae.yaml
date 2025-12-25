@@ -1,0 +1,54 @@
+# @package _global_
+#
+# scVI-style AE/VAE 超参数探索实验
+#
+# 探索不同 n_layers 和 n_hidden 组合对性能的影响
+#
+# 运行方式:
+#   python src/train.py experiment=stage1_scvi_ae
+#
+# 单独运行某个配置:
+#   python src/train.py experiment=stage1_scvi_ae model.net.n_hidden=512 model.net.n_layers=3
+
+defaults:
+  - override /data: sc_atlas_scvi
+  - override /model: scvi_stage1
+  - override /trainer: default
+
+task_name: "scvi_ae_sweep"
+
+tags: ["scvi", "ae", "sweep", "hyperparameter"]
+
+seed: 12345
+
+trainer:
+  min_epochs: 1
+  max_epochs: 2
+  gradient_clip_val: 1.0
+
+model:
+  optimizer:
+    lr: 1e-3
+  net:
+    # 默认值 (会被 sweep 覆盖)
+    n_hidden: 256
+    n_latent: 64
+    n_layers: 2
+
+logger:
+  wandb:
+    group: "scvi_ae_sweep"
+    name: "scvi_h${model.net.n_hidden}_l${model.net.n_layers}_z${model.net.n_latent}"
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # 探索不同的 hidden 维度
+      model.net.n_hidden: 256,512,1024
+
+      # 探索不同的层数
+      model.net.n_layers: 3,4
+
+      # 探索不同的 latent 维度
+      model.net.n_latent: 512

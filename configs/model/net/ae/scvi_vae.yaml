@@ -1,0 +1,33 @@
+# scVI-style Variational Autoencoder (SCVIVAE)
+#
+# 在 SCVIAE 基础上添加:
+# - 变分推断 (mu, logvar)
+# - KL 散度正则化
+# - Reparameterization trick
+#
+# 核心设计 (参考 scVI):
+# - Encoder: log1p(normalized) -> q(z|x) = N(mu, sigma^2)
+# - Decoder: z -> softmax(rho)
+# - NB mean: mu = library_size * rho
+# - Loss: -log NB(counts | mu, theta) + beta * KL(q(z|x) || p(z))
+#
+# 需要配合 SomaSCVIDataset 使用
+
+_target_: src.models.components.ae.scvi_ae.SCVIVAE
+
+# 基因数 (会被数据集覆盖)
+n_input: 28231
+
+# 网络结构
+n_hidden: 256
+n_latent: 64
+n_layers: 2
+
+# 正则化
+dropout_rate: 0.1
+activation: "GELU"
+use_residual: true
+
+# NB 分布参数
+dispersion: "gene"        # 'gene' (推荐) 或 'gene-cell'
+gene_likelihood: "nb"     # 'nb' 或 'zinb'

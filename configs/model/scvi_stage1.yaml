@@ -1,0 +1,36 @@
+# @package _global_
+# scVI-style Autoencoder for Stage 1
+#
+# 特点:
+# - Softmax decoder: 输出基因比例 (sum=1)
+# - NB Loss: 在 normalized counts 上计算
+# - Library size 分离: latent 只编码生物信号
+
+defaults:
+  - net/ae@model.net: scvi_ae
+  - _self_
+
+model:
+  _target_: src.models.ae_module.AELitModule
+
+  # 优化器
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 1e-3
+    weight_decay: 1e-5
+
+  # 学习率调度器
+  scheduler:
+    _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+    _partial_: true
+    mode: min
+    factor: 0.5
+    patience: 5
+
+  # Loss 类型 (scVI 模型自动使用 NB loss，这里仅作记录)
+  loss_type: nb
+
+  # 正则化 (可选)
+  reg_type: none
+  reg_weight: 0.0

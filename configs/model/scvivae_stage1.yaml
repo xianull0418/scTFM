@@ -1,0 +1,41 @@
+# @package _global_
+# scVI-style VAE for Stage 1 (推荐)
+#
+# 相比 SCVIAE:
+# - 添加 KL 正则化，防止 latent 塌缩
+# - KL annealing: 前几个 epoch 逐渐增加 KL 权重
+# - 更好的 latent 结构
+
+defaults:
+  - net/ae@model.net: scvi_vae
+  - _self_
+
+model:
+  _target_: src.models.ae_module.AELitModule
+
+  # 优化器
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 1e-3
+    weight_decay: 1e-5
+
+  # 学习率调度器
+  scheduler:
+    _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+    _partial_: true
+    mode: min
+    factor: 0.5
+    patience: 5
+
+  # Loss 类型
+  loss_type: nb
+
+  # VAE 参数
+  kld_weight: 0.001        # KL 权重 (beta-VAE)
+  kl_annealing: true       # 开启 KL annealing
+  kl_warmup_epochs: 10     # 前 10 个 epoch 逐渐增加 KL
+
+  # 正则化
+  reg_type: none
+  reg_weight: 0.0

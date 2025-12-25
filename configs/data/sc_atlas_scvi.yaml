@@ -1,0 +1,31 @@
+# scVI-style DataModule 配置 (Optimized - Merged Matrix)
+#
+# 使用 SomaSCVIDataset，读取合并后的矩阵:
+# - X[:, :n_genes]: log1p(normalized) - Encoder 输入
+# - X[:, n_genes:]: raw counts - NB Loss 目标
+# - obs['library_size']: 每个细胞的 UMI 总数
+#
+# 数据由 preprocess_tiledb_scvi.py 生成
+
+_target_: src.data.scvi_datamodule.SCVIDataModule
+
+# 数据存储路径 (合并后的数据目录)
+data_dir: /fast/data/scTFM/ae/tiledb_scvi_merged/
+
+# 传递给 SomaSCVIDataset 的 batch_size
+batch_size: 512
+
+# DataLoader 参数
+num_workers: 4
+
+# 是否锁页内存
+pin_memory: True
+
+# 是否保持 worker 进程存活
+persistent_workers: True
+
+# TileDB 读取块大小
+io_chunk_size: 16384
+
+# 每个 worker 预取的 batch 数量
+prefetch_factor: 2

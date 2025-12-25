@@ -1,0 +1,26 @@
+_target_: src.models.components.ae.scvae.SCVAE
+
+# ==================== 网络结构参数 ====================
+input_dim: 28231  # 根据实际基因数量调整
+hidden_dims: [1024, 512]  # ResNet-style encoder/decoder
+latent_dim: 128  # 潜在空间维度
+
+# ==================== 正则化参数 ====================
+dropout_rate: 0.1  # Dropout 比例
+
+# ==================== 激活函数 ====================
+activation: "GELU"  # 激活函数: GELU, SiLU, ReLU, LeakyReLU
+
+# ==================== 输出分布 ====================
+# 'gaussian': 高斯分布，适用于 log1p 归一化数据 (推荐)
+# 'nb': 负二项分布，适用于原始 count 数据
+# 'zinb': 零膨胀负二项，适用于高度稀疏的 count 数据
+distribution: "gaussian"
+
+# ==================== Dispersion 设置 (NB/ZINB) ====================
+# 'gene': 每个基因一个 dispersion 参数（推荐，减少过拟合）
+# 'gene-cell': 每个细胞-基因对一个 dispersion
+dispersion: "gene"
+
+# ==================== VAE 特有参数 ====================
+var_eps: 1e-4  # 最小方差（数值稳定性）

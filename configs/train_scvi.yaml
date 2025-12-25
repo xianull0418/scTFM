@@ -1,0 +1,22 @@
+# @package _global_
+# scVI-style Training Configuration
+#
+# 训练 scVI-style AE/VAE
+
+defaults:
+  - _self_
+  - data: sc_atlas_scvi
+  - model: scvi_stage1       # 或 scvivae_stage1
+  - callbacks: default
+  - logger: wandb
+  - trainer: default
+  - paths: default
+  - extra: default
+  - hydra: default
+  - experiment: null
+
+task_name: "scvi_ae_stage1"
+train: True
+test: False
+seed: 42
+ckpt_path: null

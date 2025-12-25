@@ -44,7 +44,13 @@ sys.path.append(project_root)
 os.environ["PROJECT_ROOT"] = project_root
 
 from src.models.flow_module import FlowLitModule
-from src.data.components.rtf_dataset import SomaRTFDataset
+from src.data.components.rtf_dataset import (
+    SomaRTFDataset,
+    normalize_time,
+    normalize_delta_t,
+    get_stage_map,
+    MAX_TIME_DAYS,
+)
 
 # 设置绘图风格
 sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
@@ -133,17 +139,18 @@ def compute_correlation_rowwise(x, y):
     return correlation.squeeze()
 
 
-def setup_dataloader(data_dir, split_label=2, batch_size=256, num_workers=4):
+def setup_dataloader(data_dir, split_label=3, batch_size=256, num_workers=4, stage_info_path=None, use_log_time=True):
     """
     设置 RTF 测试 DataLoader。
 
     Split Labels:
     0: Train (ID)
     1: Val (ID)
-    2: Test (ID) - 默认使用
+    2: Test (ID)
+    3: Test (OOD) - 整个 shard 作为 OOD，默认使用
     """
     logger.info(f"Setting up RTF dataloader from {data_dir}...")
-    logger.info(f"Split label: {split_label}")
+    logger.info(f"Split label: {split_label} ({'OOD' if split_label == 3 else 'ID'})")
 
     # 预扫描 shards
     preloaded_sub_uris = sorted([
@@ -160,6 +167,8 @@ def setup_dataloader(data_dir, split_label=2, batch_size=256, num_workers=4):
         batch_size=batch_size,
         direction="forward",
         preloaded_sub_uris=preloaded_sub_uris,
+        stage_info_path=stage_info_path,
+        use_log_time=use_log_time,
     )
 
     loader = DataLoader(
@@ -218,6 +227,8 @@ def evaluate_model(model, dataloader, device, sample_steps=50, max_batches=100, 
         'x_next_pred': [],
         'time_curr': [],
         'time_next': [],
+        'delta_t': [],
+        'stage': [],
     }
 
     max_vis_samples = 5000  # 最多保存多少样本用于可视化
@@ -252,6 +263,8 @@ def evaluate_model(model, dataloader, device, sample_steps=50, max_batches=100, 
                 vis_data['x_next_pred'].append(x_next_pred.cpu().numpy())
                 vis_data['time_curr'].append(cond_meta['time_curr'].cpu().numpy())
                 vis_data['time_next'].append(cond_meta['time_next'].cpu().numpy())
+                vis_data['delta_t'].append(cond_meta['delta_t'].cpu().numpy())
+                vis_data['stage'].append(cond_meta['stage'].cpu().numpy())
 
     if len(all_corrs) == 0:
         logger.warning(f"No data found for {desc}")
@@ -833,6 +846,535 @@ def plot_per_cell_metrics(vis_data, all_corrs, all_mse, save_path=None):
     return fig
 
 
+def load_shard_data_for_trajectory(
+    data_dir: str,
+    shard_name: str,
+    stage_info_path: str = None,
+    use_log_time: bool = True,
+    max_cells: int = 500
+):
+    """
+    加载单个 shard 的数据用于时序轨迹可视化。
+
+    返回按时间排序的细胞数据。
+    """
+    import tiledbsoma
+
+    shard_path = os.path.join(data_dir, shard_name)
+    if not os.path.exists(shard_path):
+        raise ValueError(f"Shard not found: {shard_path}")
+
+    ctx = tiledbsoma.SOMATileDBContext()
+
+    with tiledbsoma.Experiment.open(shard_path, context=ctx) as exp:
+        # 读取 obs 元数据
+        obs_df = exp.obs.read().concat().to_pandas()
+        if len(obs_df) == 0:
+            return None
+
+        # 读取 X 数据
+        n_vars = exp.ms["RNA"].var.count
+        x_uri = os.path.join(shard_path, "ms", "RNA", "X", "data")
+
+        # 获取所有 soma_joinid
+        soma_joinids = obs_df['soma_joinid'].values
+        soma_joinids_sorted = np.sort(soma_joinids)
+
+        # 读取稀疏数据
+        X_dense = np.zeros((len(soma_joinids_sorted), n_vars), dtype=np.float32)
+
+        with tiledbsoma.open(x_uri, mode='r', context=ctx) as X:
+            data = X.read(coords=(soma_joinids_sorted, slice(None))).tables().concat()
+            row_indices = data["soma_dim_0"].to_numpy()
+            col_indices = data["soma_dim_1"].to_numpy()
+            values = data["soma_data"].to_numpy()
+
+            local_rows = np.searchsorted(soma_joinids_sorted, row_indices)
+            X_dense[local_rows, col_indices] = values
+
+        # 构建 joinid -> 行索引映射
+        joinid_to_row = {jid: i for i, jid in enumerate(soma_joinids_sorted)}
+
+        # 获取原始时间并排序
+        obs_df['raw_time'] = obs_df['time'].astype(float)
+        obs_df = obs_df.sort_values('raw_time')
+
+        # 获取唯一时间点
+        unique_times = obs_df['raw_time'].unique()
+        unique_times = np.sort(unique_times)
+
+        # 按时间分组
+        time_groups = {}
+        for t in unique_times:
+            cells_at_t = obs_df[obs_df['raw_time'] == t]
+            if len(cells_at_t) > 0:
+                # 随机采样（避免数据过多）
+                if len(cells_at_t) > max_cells:
+                    cells_at_t = cells_at_t.sample(n=max_cells, random_state=42)
+
+                joinids = cells_at_t['soma_joinid'].values
+                rows = [joinid_to_row[jid] for jid in joinids]
+                time_groups[t] = {
+                    'X': X_dense[rows],
+                    'time_raw': t,
+                    'time_norm': normalize_time(t, use_log_time),
+                    'n_cells': len(rows),
+                }
+
+    return {
+        'shard_name': shard_name,
+        'unique_times': unique_times,
+        'time_groups': time_groups,
+        'n_vars': n_vars,
+    }
+
+
+def generate_autoregressive_trajectory(
+    model,
+    initial_cells: np.ndarray,
+    time_points: list,
+    stage_id: int,
+    device,
+    sample_steps: int = 50,
+    use_log_time: bool = True,
+):
+    """
+    从初始时间点开始，自回归生成后续时间点的细胞状态。
+
+    Args:
+        model: FlowLitModule
+        initial_cells: 初始时间点的真实细胞 [N, D]
+        time_points: 原始时间点列表（天）
+        stage_id: 发育阶段 ID
+        device: 设备
+        sample_steps: ODE 步数
+        use_log_time: 是否使用 log-scale 时间
+
+    Returns:
+        Dict[time -> generated_cells]
+    """
+    model.eval()
+
+    generated = {}
+    current_cells = torch.tensor(initial_cells, dtype=torch.float32, device=device)
+    n_cells = current_cells.shape[0]
+
+    # 第一个时间点使用真实数据
+    generated[time_points[0]] = initial_cells.copy()
+
+    with torch.no_grad():
+        for i in range(len(time_points) - 1):
+            time_curr_raw = time_points[i]
+            time_next_raw = time_points[i + 1]
+            delta_t_raw = time_next_raw - time_curr_raw
+
+            # 归一化时间
+            time_curr_norm = normalize_time(time_curr_raw, use_log_time)
+            time_next_norm = normalize_time(time_next_raw, use_log_time)
+            delta_t_norm = normalize_delta_t(delta_t_raw, use_log_time)
+
+            # 构建条件
+            cond_data = {
+                'time_curr': torch.full((n_cells,), time_curr_norm, dtype=torch.float32, device=device),
+                'time_next': torch.full((n_cells,), time_next_norm, dtype=torch.float32, device=device),
+                'delta_t': torch.full((n_cells,), delta_t_norm, dtype=torch.float32, device=device),
+                'stage': torch.full((n_cells,), stage_id, dtype=torch.long, device=device),
+                'x_curr': current_cells,
+            }
+
+            # 从噪声采样
+            x0 = torch.randn_like(current_cells)
+            x_next = model.flow.sample(x0, cond_data, steps=sample_steps, method='euler')
+
+            generated[time_next_raw] = x_next.cpu().numpy()
+            current_cells = x_next  # 下一轮的输入
+
+    return generated
+
+
+def plot_temporal_trajectory_comparison(
+    shard_data: dict,
+    generated_data: dict,
+    save_path: str = None,
+    n_samples_per_time: int = 200,
+):
+    """
+    绘制时序轨迹对比图：
+    - 上图：真实数据按时间的 UMAP 分布
+    - 下图：生成数据（初始真实 + 后续自回归生成）的 UMAP 分布
+
+    Args:
+        shard_data: load_shard_data_for_trajectory 返回的数据
+        generated_data: generate_autoregressive_trajectory 返回的数据
+        save_path: 保存路径
+        n_samples_per_time: 每个时间点最多显示的样本数
+    """
+    time_groups = shard_data['time_groups']
+    unique_times = sorted(time_groups.keys())
+
+    # 收集所有数据用于 UMAP
+    all_real = []
+    all_gen = []
+    real_time_labels = []
+    gen_time_labels = []
+
+    for t in unique_times:
+        if t not in time_groups:
+            continue
+
+        # 真实数据
+        real_X = time_groups[t]['X']
+        n_real = min(len(real_X), n_samples_per_time)
+        all_real.append(real_X[:n_real])
+        real_time_labels.extend([t] * n_real)
+
+        # 生成数据
+        if t in generated_data:
+            gen_X = generated_data[t]
+            n_gen = min(len(gen_X), n_samples_per_time)
+            all_gen.append(gen_X[:n_gen])
+            gen_time_labels.extend([t] * n_gen)
+
+    if len(all_real) == 0 or len(all_gen) == 0:
+        logger.warning("No data for trajectory visualization")
+        return None
+
+    all_real = np.vstack(all_real)
+    all_gen = np.vstack(all_gen)
+    real_time_labels = np.array(real_time_labels)
+    gen_time_labels = np.array(gen_time_labels)
+
+    # 合并计算 UMAP（确保坐标一致）
+    logger.info(f"Computing UMAP for trajectory visualization ({len(all_real)} real + {len(all_gen)} gen cells)...")
+    all_data = np.vstack([all_real, all_gen])
+    reducer = umap.UMAP(n_neighbors=30, min_dist=0.3, metric='euclidean', random_state=42)
+    all_umap = reducer.fit_transform(all_data)
+
+    n_real_total = len(all_real)
+    umap_real = all_umap[:n_real_total]
+    umap_gen = all_umap[n_real_total:]
+
+    # 创建图
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+    # 颜色映射：时间 -> 颜色
+    time_min, time_max = min(unique_times), max(unique_times)
+    norm = plt.Normalize(vmin=time_min, vmax=time_max)
+    cmap = plt.cm.viridis
+
+    # 左图：真实数据
+    ax = axes[0]
+    scatter1 = ax.scatter(
+        umap_real[:, 0], umap_real[:, 1],
+        c=real_time_labels, cmap=cmap, norm=norm,
+        s=15, alpha=0.6, edgecolors='none'
+    )
+    ax.set_xlabel('UMAP1', fontsize=12)
+    ax.set_ylabel('UMAP2', fontsize=12)
+    ax.set_title(f'Real Data ({shard_data["shard_name"]})', fontsize=14)
+    ax.grid(True, linestyle='--', alpha=0.2)
+
+    # 右图：生成数据
+    ax = axes[1]
+
+    # 标记初始时间点（真实）和后续时间点（生成）
+    first_time = unique_times[0]
+    is_initial = gen_time_labels == first_time
+
+    # 初始时间点用方形标记（真实）
+    if np.any(is_initial):
+        ax.scatter(
+            umap_gen[is_initial, 0], umap_gen[is_initial, 1],
+            c=gen_time_labels[is_initial], cmap=cmap, norm=norm,
+            s=20, alpha=0.7, marker='s', edgecolors='black', linewidths=0.3,
+            label='Real (initial)'
+        )
+
+    # 后续时间点用圆形标记（生成）
+    if np.any(~is_initial):
+        ax.scatter(
+            umap_gen[~is_initial, 0], umap_gen[~is_initial, 1],
+            c=gen_time_labels[~is_initial], cmap=cmap, norm=norm,
+            s=15, alpha=0.6, marker='o', edgecolors='none',
+            label='Generated (autoregressive)'
+        )
+
+    ax.set_xlabel('UMAP1', fontsize=12)
+    ax.set_ylabel('UMAP2', fontsize=12)
+    ax.set_title('RTF Autoregressive Generation', fontsize=14)
+    ax.legend(loc='upper right', fontsize=9)
+    ax.grid(True, linestyle='--', alpha=0.2)
+
+    # 共享 colorbar（转换为年龄）
+    cbar = fig.colorbar(scatter1, ax=axes, shrink=0.8, aspect=30)
+    # 将天数转换为年（用于显示）
+    tick_locs = cbar.get_ticks()
+    tick_labels = [f'{t/365.25:.1f}y' for t in tick_locs]
+    cbar.set_ticklabels(tick_labels)
+    cbar.set_label('Age (years)', fontsize=12)
+
+    plt.suptitle('Temporal Trajectory: Real vs Autoregressive Generation', fontsize=16, y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+    return fig
+
+
+def plot_temporal_trajectory_stripplot(
+    shard_data: dict,
+    generated_data: dict,
+    save_path: str = None,
+    n_samples_per_time: int = 100,
+):
+    """
+    绘制时序轨迹的 strip plot：
+    - X 轴：时间（年龄）
+    - Y 轴：PCA 第一主成分（代表发育程度）
+
+    对比真实数据 vs 生成数据
+    """
+    from sklearn.decomposition import PCA
+
+    time_groups = shard_data['time_groups']
+    unique_times = sorted(time_groups.keys())
+
+    # 收集数据
+    all_real = []
+    all_gen = []
+    real_times = []
+    gen_times = []
+    real_is_initial = []
+    gen_is_initial = []
+
+    first_time = unique_times[0]
+
+    for t in unique_times:
+        if t not in time_groups:
+            continue
+
+        # 真实数据
+        real_X = time_groups[t]['X']
+        n = min(len(real_X), n_samples_per_time)
+        all_real.append(real_X[:n])
+        real_times.extend([t] * n)
+        real_is_initial.extend([t == first_time] * n)
+
+        # 生成数据
+        if t in generated_data:
+            gen_X = generated_data[t]
+            n_gen = min(len(gen_X), n_samples_per_time)
+            all_gen.append(gen_X[:n_gen])
+            gen_times.extend([t] * n_gen)
+            gen_is_initial.extend([t == first_time] * n_gen)
+
+    if len(all_real) == 0:
+        return None
+
+    all_real = np.vstack(all_real)
+    all_gen = np.vstack(all_gen) if all_gen else np.array([])
+    real_times = np.array(real_times)
+    gen_times = np.array(gen_times) if gen_times else np.array([])
+
+    # PCA 降维
+    all_data = np.vstack([all_real, all_gen]) if len(all_gen) > 0 else all_real
+    pca = PCA(n_components=2)
+    all_pca = pca.fit_transform(all_data)
+
+    n_real = len(all_real)
+    pca_real = all_pca[:n_real]
+    pca_gen = all_pca[n_real:] if len(all_gen) > 0 else np.array([])
+
+    # 创建图
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+
+    # 转换时间为年
+    real_years = real_times / 365.25
+    gen_years = gen_times / 365.25 if len(gen_times) > 0 else np.array([])
+
+    # 上图：真实数据
+    ax = axes[0]
+    scatter1 = ax.scatter(
+        real_years, pca_real[:, 0],
+        c=real_times, cmap='viridis', s=20, alpha=0.6
+    )
+    ax.set_ylabel('PC1 (Developmental Axis)', fontsize=12)
+    ax.set_title('Real Data', fontsize=14)
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    # 添加时间点的 boxplot 轮廓
+    unique_years = sorted(set(real_years))
+    for year in unique_years:
+        mask = real_years == year
+        pc1_vals = pca_real[mask, 0]
+        if len(pc1_vals) > 5:
+            q25, q75 = np.percentile(pc1_vals, [25, 75])
+            ax.plot([year, year], [q25, q75], 'k-', lw=2, alpha=0.5)
+
+    # 下图：生成数据
+    ax = axes[1]
+    if len(pca_gen) > 0:
+        gen_is_initial = np.array(gen_is_initial)
+
+        # 初始点（真实）- 方形
+        mask_init = gen_is_initial
+        if np.any(mask_init):
+            ax.scatter(
+                gen_years[mask_init], pca_gen[mask_init, 0],
+                c=gen_times[mask_init], cmap='viridis', s=30, alpha=0.7,
+                marker='s', edgecolors='black', linewidths=0.5,
+                label='Real (initial)'
+            )
+
+        # 生成点 - 圆形
+        mask_gen = ~gen_is_initial
+        if np.any(mask_gen):
+            ax.scatter(
+                gen_years[mask_gen], pca_gen[mask_gen, 0],
+                c=gen_times[mask_gen], cmap='viridis', s=20, alpha=0.6,
+                marker='o', label='Generated'
+            )
+
+        ax.legend(loc='upper left', fontsize=10)
+
+    ax.set_xlabel('Age (years)', fontsize=12)
+    ax.set_ylabel('PC1 (Developmental Axis)', fontsize=12)
+    ax.set_title('RTF Autoregressive Generation', fontsize=14)
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    # Colorbar
+    cbar = fig.colorbar(scatter1, ax=axes, shrink=0.8, aspect=40)
+    tick_locs = cbar.get_ticks()
+    tick_labels = [f'{t/365.25:.1f}y' for t in tick_locs]
+    cbar.set_ticklabels(tick_labels)
+    cbar.set_label('Age (years)', fontsize=12)
+
+    plt.suptitle(f'Temporal Development: {shard_data["shard_name"]}', fontsize=16, y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+    return fig
+
+
+def run_trajectory_visualization(
+    model,
+    data_dir: str,
+    device,
+    stage_info_path: str = None,
+    use_log_time: bool = True,
+    sample_steps: int = 50,
+    max_shards: int = 3,
+    save_dir: str = None,
+):
+    """
+    运行时序轨迹可视化。
+
+    选择包含多个时间点的 shards，展示自回归生成效果。
+    """
+    # 获取 Stage 映射
+    stage_map = get_stage_map(stage_info_path)
+
+    # 扫描 shards
+    shard_names = sorted([
+        d for d in os.listdir(data_dir)
+        if os.path.isdir(os.path.join(data_dir, d))
+    ])
+
+    logger.info(f"Scanning {len(shard_names)} shards for trajectory visualization...")
+
+    # 选择包含多个时间点的 shards
+    selected_shards = []
+    for shard_name in shard_names:
+        try:
+            shard_data = load_shard_data_for_trajectory(
+                data_dir, shard_name,
+                stage_info_path=stage_info_path,
+                use_log_time=use_log_time,
+                max_cells=200
+            )
+            if shard_data is None:
+                continue
+
+            n_time_points = len(shard_data['unique_times'])
+            if n_time_points >= 3:  # 至少 3 个时间点
+                selected_shards.append({
+                    'name': shard_name,
+                    'n_times': n_time_points,
+                    'data': shard_data,
+                })
+                logger.info(f"  {shard_name}: {n_time_points} time points")
+
+        except Exception as e:
+            logger.warning(f"  Skip {shard_name}: {e}")
+            continue
+
+        if len(selected_shards) >= max_shards:
+            break
+
+    if len(selected_shards) == 0:
+        logger.warning("No suitable shards found for trajectory visualization")
+        return []
+
+    # 生成并绘图
+    figures = []
+    for shard_info in selected_shards:
+        shard_name = shard_info['name']
+        shard_data = shard_info['data']
+        unique_times = shard_data['unique_times']
+
+        logger.info(f"Generating trajectory for {shard_name}...")
+
+        # 获取 stage ID
+        stage_id = stage_map.get(shard_name, 0)
+
+        # 获取初始时间点的真实细胞
+        first_time = unique_times[0]
+        initial_cells = shard_data['time_groups'][first_time]['X']
+
+        # 自回归生成
+        generated = generate_autoregressive_trajectory(
+            model,
+            initial_cells,
+            list(unique_times),
+            stage_id,
+            device,
+            sample_steps=sample_steps,
+            use_log_time=use_log_time,
+        )
+
+        # 绘制 UMAP 对比图
+        if save_dir:
+            save_path_umap = os.path.join(save_dir, f"trajectory_umap_{shard_name}.png")
+            save_path_strip = os.path.join(save_dir, f"trajectory_strip_{shard_name}.png")
+        else:
+            save_path_umap = f"trajectory_umap_{shard_name}.png"
+            save_path_strip = f"trajectory_strip_{shard_name}.png"
+
+        fig_umap = plot_temporal_trajectory_comparison(
+            shard_data, generated,
+            save_path=save_path_umap
+        )
+        fig_strip = plot_temporal_trajectory_stripplot(
+            shard_data, generated,
+            save_path=save_path_strip
+        )
+
+        figures.append({
+            'shard_name': shard_name,
+            'fig_umap': fig_umap,
+            'fig_strip': fig_strip,
+            'save_path_umap': save_path_umap,
+            'save_path_strip': save_path_strip,
+        })
+
+    return figures
+
+
 def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=50, max_batches=100, cfg_scale=1.0):
     """
     对单个运行进行评测。
@@ -867,13 +1409,26 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
     logger.info("Loading model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # [关键] 如果是 latent 模式，需要从 AE checkpoint 推断 input_dim
-    # 因为 hydra 配置保存的是修改前的默认值
+    # [关键] 如果是 latent 模式，需要推断正确的 input_dim
+    # 因为 hydra 配置保存的可能是默认值
     mode = cfg.model.get("mode", "raw")
     ae_ckpt_path = cfg.model.get("ae_ckpt_path")
 
-    if mode == "latent" and ae_ckpt_path:
-        # 尝试从 AE checkpoint 的 hydra 配置读取 latent_dim
+    # 先尝试从 checkpoint 本身推断 input_dim
+    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    state_dict = checkpoint.get('state_dict', checkpoint)
+
+    # 从 x_embedder.weight 推断 input_dim
+    x_embedder_key = 'flow.backbone.x_embedder.weight'
+    if x_embedder_key in state_dict:
+        # shape: [hidden_size, input_dim]
+        inferred_input_dim = state_dict[x_embedder_key].shape[1]
+        logger.info(f"Inferred input_dim={inferred_input_dim} from checkpoint")
+        OmegaConf.set_struct(cfg, False)
+        cfg.model.net.input_dim = inferred_input_dim
+        OmegaConf.set_struct(cfg, True)
+    elif mode == "latent" and ae_ckpt_path:
+        # 回退：尝试从 AE checkpoint 的 hydra 配置读取 latent_dim
         from pathlib import Path
         ae_ckpt_dir = Path(ae_ckpt_path).parent.parent
         ae_hydra_config = ae_ckpt_dir / ".hydra" / "config.yaml"
@@ -882,10 +1437,12 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
             ae_cfg = OmegaConf.load(ae_hydra_config)
             latent_dim = ae_cfg.get('model', {}).get('net', {}).get('latent_dim')
             if latent_dim:
-                logger.info(f"Inferred input_dim={latent_dim} from AE checkpoint")
+                logger.info(f"Inferred input_dim={latent_dim} from AE config")
                 OmegaConf.set_struct(cfg, False)
                 cfg.model.net.input_dim = latent_dim
                 OmegaConf.set_struct(cfg, True)
+
+    del checkpoint  # 释放内存
 
     # 实例化 backbone net
     net_cfg = cfg.model.net
@@ -927,8 +1484,15 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
     batch_size = cfg.data.get("batch_size", 256)
     num_workers = cfg.data.get("num_workers", 4)
 
-    # 使用验证集（split_label=1）进行评测，因为测试集可能没有
-    loader = setup_dataloader(data_dir, split_label=1, batch_size=batch_size, num_workers=num_workers)
+    # 获取 stage_info_path 和 use_log_time
+    stage_info_path = cfg.data.get("stage_info_path")
+    use_log_time = cfg.data.get("use_log_time", True)
+
+    # 使用 OOD（split_label=3）进行评测，整个 shard 作为 OOD
+    loader = setup_dataloader(
+        data_dir, split_label=3, batch_size=batch_size, num_workers=num_workers,
+        stage_info_path=stage_info_path, use_log_time=use_log_time
+    )
 
     # 5. 初始化 W&B
     logger.info("Initializing W&B...")
@@ -1064,6 +1628,33 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
     wandb.log({"plots/umap_comparison": wandb.Image(fig_path)})
     os.remove(fig_path)
 
+    # 7.11 时序轨迹可视化（自回归生成）
+    logger.info("Generating temporal trajectory visualizations...")
+    try:
+        trajectory_figs = run_trajectory_visualization(
+            model,
+            data_dir,
+            device,
+            stage_info_path=stage_info_path,
+            use_log_time=use_log_time,
+            sample_steps=sample_steps,
+            max_shards=3,
+            save_dir=None,
+        )
+        for fig_info in trajectory_figs:
+            shard_name = fig_info['shard_name']
+            # 上传 UMAP 图
+            if fig_info['save_path_umap'] and os.path.exists(fig_info['save_path_umap']):
+                wandb.log({f"plots/trajectory_umap_{shard_name}": wandb.Image(fig_info['save_path_umap'])})
+                os.remove(fig_info['save_path_umap'])
+            # 上传 Strip plot 图
+            if fig_info['save_path_strip'] and os.path.exists(fig_info['save_path_strip']):
+                wandb.log({f"plots/trajectory_strip_{shard_name}": wandb.Image(fig_info['save_path_strip'])})
+                os.remove(fig_info['save_path_strip'])
+        logger.info(f"Generated trajectory visualizations for {len(trajectory_figs)} shards")
+    except Exception as e:
+        logger.warning(f"Failed to generate trajectory visualizations: {e}")
+
     logger.info(f"Benchmark complete for run [{run_idx}/{total_runs}]")
     wandb.finish()
 
@@ -1071,7 +1662,7 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
 def main():
     parser = argparse.ArgumentParser(description="RTF 模型批量测评脚本")
     parser.add_argument("--dir", type=str, required=True, help="包含运行日志的目录")
-    parser.add_argument("--wandb_project", type=str, default="scTime-RTF-bench", help="W&B 项目名称")
+    parser.add_argument("--wandb_project", type=str, default="rtf-cross-bench-cfg", help="W&B 项目名称")
     parser.add_argument("--sample_steps", type=int, default=50, help="ODE 采样步数")
     parser.add_argument("--max_batches", type=int, default=100, help="最大评估批次数")
     parser.add_argument("--cfg_scale", type=float, default=1.0,
