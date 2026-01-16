@@ -28,6 +28,8 @@ recon_loss = -log_nb_positive(target, mu_all, theta_all).mean()
 | Masked      | 掩码预测    | MSE(pred_genes[mask], x[mask]) |
 
 ### 2026-01-14
+
+- /fast/projects/scTFM/models/ae/2026-01-16_04-13-53
   - z_all 包含所有细胞的 latent (batch, set_size, n_latent)
   - 但 decode_cell 只解码中心细胞
   - 重建损失只计算中心细胞
